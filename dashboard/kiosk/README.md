@@ -1,6 +1,8 @@
 # Home HQ kiosk navigation
 
-Hold two fingers still on the dashboard for 1.5 seconds to open the native controls:
+Hold two fingers still on the dashboard for 1.5 seconds to open the native controls. Keep the
+fingers at least an inch (about 2.5 cm) apart: on PF1007L frames the `gslX680` touchscreen reads
+closer fingers as one touch.
 
 - **Open launcher** opens another installed Home app, such as Rootless Launcher.
   If none is available, it opens Android Settings.
@@ -23,6 +25,30 @@ URL when run without one.
 Every later launch, including after a reboot, opens the saved URL. Links that other apps open
 in the kiosk, such as a sign-in page, are shown but not saved.
 
+## A page bundled in the APK (no server)
+
+A static page can ship inside the APK instead of being hosted. Build with `KIOSK_SITE` set to a
+folder that has an `index.html` (from `dashboard/`):
+
+```sh
+KIOSK_SITE=/path/to/site ANDROID_HOME=/path/to/android-sdk bash kiosk/build.sh
+adb install -r kiosk/build/homehq.apk
+adb shell am start -n com.wesbos.homehq/.MainActivity --es url 'http://127.0.0.1:8765/'
+```
+
+On Windows, set `$env:KIOSK_SITE` before `.\build.ps1`.
+
+Home HQ answers `http://127.0.0.1:8765/` from those files itself. Nothing listens on the port, no
+other machine is needed, and the page loads without Wi-Fi. Every other URL, including the page's
+own API calls, goes to the network as usual. ES modules work, which a `file://` page can't do, and
+`localStorage` belongs to the `http://127.0.0.1:8765` origin. A query string
+(`http://127.0.0.1:8765/?room=kitchen`) reaches the page unchanged; quote the URL in `adb shell`.
+Don't put API keys or tokens in the bundled files or the saved URL: anyone with ADB on the frame
+can read them, and so can any page shown at that origin. Keep them on a server
+([building-for-the-frame.md](../../docs/building-for-the-frame.md)).
+To change the page, rebuild and `adb install -r`. Without `KIOSK_SITE` the APK bundles nothing
+and the address answers 404.
+
 ## Start at boot
 
 To have the frame boot into the dashboard, make the kiosk its Home app. Installing the kiosk
@@ -32,6 +58,11 @@ does not offer it as a Home app, so nothing changes until you run:
 adb shell am start -n com.wesbos.homehq/.MainActivity --ez home true
 adb shell cmd package set-home-activity com.wesbos.homehq/.Home
 ```
+
+Wait about 30 seconds before rebooting. Android saves the Home alias a few seconds later, and on
+a PF1508 (Android 15, #167) a reboot 2 seconds after these commands turned the alias back off, so the
+frame booted into the previous Home app. The same delayed save lost a `pm disable-user` on a
+Pastigio FRAME156 (#139).
 
 Android 6 frames (PF1007L, BIUFRAME) don't have `cmd package set-home-activity`. After the first
 command, open the Home chooser instead, then tap **Home HQ** and **Always** on the frame. Keep
@@ -122,13 +153,32 @@ screen. The error page would print the full URL, including any token in it.
 - **No Wi-Fi:** "Connect to Wi-Fi?" with an **Open Wi-Fi settings** button.
 - **Wi-Fi is up but the dashboard is unreachable:** "Can't reach the dashboard".
 
-Home HQ keeps retrying every 5 seconds, and the screen disappears once a load
-succeeds. Wi-Fi settings open only when tapped, because Wi-Fi is often still
-connecting for the first minute after boot.
+- **Certificate error:** never bypassed. If the error is about the date, the screen says
+  "Setting the clock…". Frames with no clock battery start with an old date after a power cut
+  (a Runxion SSA ZN-DP1002 came up on May 14, 2021), so every HTTPS certificate fails until
+  network time arrives, about 20 seconds after Wi-Fi joins.
+
+Home HQ keeps retrying every 5 seconds, and retries at once when Wi-Fi connects or the clock
+changes. The screen disappears once a load succeeds. Wi-Fi settings open only when tapped,
+because Wi-Fi is often still connecting for the first minute after boot.
 
 On frames without a navigation bar (most PF1007L units), set up the navigation service in
 [Frames without Home or Back buttons](#frames-without-home-or-back-buttons) first. Otherwise
 **Open Wi-Fi settings** leaves no way back to the dashboard.
+
+## Time zone
+
+After changing the frame's time zone over ADB (`setprop persist.sys.timezone <zone>` and
+`service call alarm 3 s16 <zone>` on Android 6; the transaction number differs on other versions), restart the kiosk. Until then the page keeps the old zone,
+while `date` on the frame already shows the new one:
+
+```sh
+adb shell am force-stop com.wesbos.homehq
+adb shell am start -n com.wesbos.homehq/.MainActivity
+```
+
+Seen on an Android 6 Runxion (WebView 107). Changing the zone in Android Settings has not been
+compared.
 
 ## Build and install
 
@@ -150,3 +200,8 @@ adb install -r kiosk/build/homehq.apk
 
 The kiosk loads the existing hosted dashboard over the frame's Wi-Fi. A USB
 connection is only needed for installation or diagnostics, not normal use.
+
+The kiosk targets Android 9 (SDK 28); the minimum is still Android 6 (SDK 23). Android 15
+refuses to install targets below 24 (`INSTALL_FAILED_DEPRECATED_SDK_VERSION`), and Android 14
+and later show a "built for an older version of Android" dialog on the first launch for targets
+below 28.

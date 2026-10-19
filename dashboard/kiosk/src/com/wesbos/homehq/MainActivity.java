@@ -14,16 +14,22 @@ import android.graphics.Color;
 import android.net.ConnectivityManager;
 import android.net.NetworkInfo;
 import android.net.Uri;
+import android.net.http.SslError;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.SystemClock;
 import android.provider.Settings;
 import android.util.Log;
 import android.util.TypedValue;
 import android.view.Gravity;
+import android.view.InputDevice;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.WindowManager;
+import android.webkit.SslErrorHandler;
+import android.webkit.WebResourceRequest;
+import android.webkit.WebResourceResponse;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
@@ -31,6 +37,11 @@ import android.widget.Button;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.TextView;
+import java.io.IOException;
+import java.io.InputStream;
+import java.util.HashMap;
+import java.util.Locale;
+import java.util.Map;
 
 /**
  * Full-screen kiosk WebView for the Home HQ wall tablet.
@@ -43,6 +54,8 @@ import android.widget.TextView;
  *     adb shell am start -n com.wesbos.homehq/.MainActivity --ez debug true
  * - Launch with a URL: adb shell am start -a android.intent.action.VIEW -d <url> -n com.wesbos.homehq/.MainActivity
  * - Set the saved URL, used on every later launch: adb shell am start -n com.wesbos.homehq/.MainActivity --es url <url>
+ * - A site bundled at build time (KIOSK_SITE) is answered at http://127.0.0.1:8765/ from the
+ *   APK's assets/site/, with no server; every other URL goes to the network as usual.
  * - Offer the kiosk as a Home app (--ez home false undoes it), then pick it:
  *     adb shell am start -n com.wesbos.homehq/.MainActivity --ez home true
  *     adb shell cmd package set-home-activity com.wesbos.homehq/.Home
@@ -53,11 +66,15 @@ public class MainActivity extends Activity {
   static final String PREFS = "kiosk";
   static final String PREF_URL = "url";
   static final long EXIT_HOLD_MS = 1500;
+  static final int CANCEL_POINTER_IDS = 10; // touch ids 0-9
   static final long RETRY_MS = 5000;
   static final long STALL_MS = 15000;
   static final long NAV_CHECK_MS = 5000;
   static final long NAV_REBIND_MS = 1000;
   static final float EXIT_SLOP_PX = 60;
+  static final String LOCAL_HOST = "127.0.0.1";
+  static final int LOCAL_PORT = 8765;
+  static final String LOCAL_ASSETS = "site";
 
   private WebView web;
   private final Handler handler = new Handler(Looper.getMainLooper());
@@ -68,15 +85,19 @@ public class MainActivity extends Activity {
   private final float[] exitY = new float[2];
   private boolean exitArmed;
   private String retryUrl;
+  private String mainUrl;
   private boolean pageFailed;
+  // A retry is queued: keep the offline screen up until it runs, even if the failed load "finishes".
+  private boolean retryPending;
   private LinearLayout offline;
   private TextView offlineTitle, offlineText;
 
   private final Runnable retry = new Runnable() {
     @Override
     public void run() {
+      retryPending = false;
       if (retryUrl == null) return;
-      web.loadUrl(retryUrl);
+      load(retryUrl);
       // A retry started while Wi-Fi is joining can hang for about a minute with no error and no
       // finish, so no further retry is posted. Start a new one if it is still pending.
       handler.removeCallbacks(stall);
@@ -99,10 +120,11 @@ public class MainActivity extends Activity {
     @Override
     public void onReceive(Context context, Intent intent) {
       if (retryUrl == null || offline.getVisibility() != View.VISIBLE || !wifiConnected()) return;
-      Log.i(TAG, "Wi-Fi connected, retrying now");
+      Log.i(TAG, "Wi-Fi connected or clock changed, retrying now");
       showOffline();
       handler.removeCallbacks(retry);
       handler.removeCallbacks(stall);
+      retryPending = true;
       handler.post(retry);
     }
   };
@@ -112,6 +134,7 @@ public class MainActivity extends Activity {
     public void run() {
       exitArmed = false;
       Log.i(TAG, "Two-finger hold: opening controls");
+      cancelPageTouches();
       new AlertDialog.Builder(MainActivity.this)
           .setTitle("Home HQ")
           .setItems(new String[] {"Open launcher", "Android settings", "Wi-Fi settings", "Reload dashboard"},
@@ -145,8 +168,14 @@ public class MainActivity extends Activity {
     // The offline screen covers WebView's error page until a load succeeds.
     web.setWebViewClient(new WebViewClient() {
       @Override
+      public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest req) {
+        return localAsset(req.getUrl());
+      }
+
+      @Override
       public void onPageStarted(WebView view, String url, Bitmap icon) {
         pageFailed = false;
+        mainUrl = url;
       }
 
       @Override
@@ -157,7 +186,7 @@ public class MainActivity extends Activity {
 
       @Override
       public void onPageFinished(WebView view, String url) {
-        if (!pageFailed) {
+        if (!pageFailed && !retryPending) {
           offline.setVisibility(View.GONE);
           handler.removeCallbacks(stall);
         }
@@ -172,6 +201,34 @@ public class MainActivity extends Activity {
         retryUrl = failingUrl;
         handler.removeCallbacks(retry);
         handler.removeCallbacks(stall);
+        retryPending = true;
+        handler.postDelayed(retry, RETRY_MS);
+      }
+
+      @Override
+      public void onReceivedSslError(WebView view, SslErrorHandler h, SslError error) {
+        // Never bypass a certificate error. Frames without a clock battery boot with an old date
+        // after a power cut, so every certificate looks invalid until network time arrives. Treat
+        // it as a failed load and retry the saved page until the clock is right.
+        h.cancel();
+        // Images and scripts report certificate errors here too. Android 6 doesn't trust every
+        // CA, so one such image must not cover a working page; only the page itself counts.
+        if (mainUrl != null && !mainUrl.equals(error.getUrl())) {
+          Log.w(TAG, "Certificate error " + error.getPrimaryError() + " on a subresource; blocked");
+          return;
+        }
+        Log.w(TAG, "Certificate error " + error.getPrimaryError() + ", retrying in " + RETRY_MS + " ms");
+        pageFailed = true;
+        showOffline();
+        if (error.hasError(SslError.SSL_NOTYETVALID) || error.hasError(SslError.SSL_EXPIRED)
+            || error.hasError(SslError.SSL_DATE_INVALID)) {
+          offlineTitle.setText("Setting the clock\u2026");
+          offlineText.setText("The frame's date is wrong after a power cut. It reloads once the time is set.");
+        }
+        retryUrl = error.getUrl() != null ? error.getUrl() : savedUrl();
+        handler.removeCallbacks(retry);
+        handler.removeCallbacks(stall);
+        retryPending = true;
         handler.postDelayed(retry, RETRY_MS);
       }
     });
@@ -181,9 +238,10 @@ public class MainActivity extends Activity {
     setContentView(root);
 
     String url = urlFrom(getIntent());
-    web.loadUrl(url != null ? url : savedUrl());
+    load(url != null ? url : savedUrl());
     @SuppressWarnings("deprecation")
     IntentFilter connectivity = new IntentFilter(ConnectivityManager.CONNECTIVITY_ACTION);
+    connectivity.addAction(Intent.ACTION_TIME_CHANGED); // network time arrived after a power cut
     registerReceiver(networkChange, connectivity);
   }
 
@@ -210,8 +268,9 @@ public class MainActivity extends Activity {
     if (url != null) {
       handler.removeCallbacks(retry);
       handler.removeCallbacks(stall);
+      retryPending = false;
       retryUrl = url;
-      web.loadUrl(url);
+      load(url);
     }
   }
 
@@ -222,16 +281,77 @@ public class MainActivity extends Activity {
     // The activity is exported, so only save web URLs: never file:, content: or javascript:.
     String scheme = Uri.parse(saved).getScheme();
     if (!"http".equalsIgnoreCase(scheme) && !"https".equalsIgnoreCase(scheme)) {
-      Log.w(TAG, "Ignoring non-web kiosk URL: " + saved);
+      Log.w(TAG, "Ignoring non-web kiosk URL (scheme " + scheme + ")");
       return null;
     }
     getSharedPreferences(PREFS, MODE_PRIVATE).edit().putString(PREF_URL, saved).apply();
-    Log.i(TAG, "Saved kiosk URL: " + saved);
+    Log.i(TAG, "Saved kiosk URL: " + forLog(saved));
     return saved;
+  }
+
+  /**
+   * The URL without user info, query or fragment, for logcat. Those parts can carry API keys or
+   * tokens, and any app with READ_LOGS (or anyone with ADB) can read the log.
+   */
+  static String forLog(String url) {
+    Uri u = Uri.parse(url);
+    String port = u.getPort() == -1 ? "" : ":" + u.getPort();
+    String path = u.getEncodedPath() == null ? "" : u.getEncodedPath();
+    boolean hidden = u.getEncodedUserInfo() != null || u.getEncodedQuery() != null
+        || u.getEncodedFragment() != null;
+    return u.getScheme() + "://" + u.getHost() + port + path + (hidden ? " (query, fragment or user info not logged)" : "");
+  }
+
+  // Some WebViews report the page's certificate error before onPageStarted, so remember the
+  // page here too.
+  private void load(String url) {
+    mainUrl = url;
+    web.loadUrl(url);
   }
 
   private String savedUrl() {
     return getSharedPreferences(PREFS, MODE_PRIVATE).getString(PREF_URL, DEFAULT_URL);
+  }
+
+  /**
+   * Answers http://127.0.0.1:8765/<path> from assets/site/<path> (bundled by build.sh from
+   * KIOSK_SITE). Any other URL returns null and goes to the network as usual. Nothing listens on
+   * the port; only this WebView sees these responses. Paths ending in / get index.html.
+   */
+  private WebResourceResponse localAsset(Uri u) {
+    if (u == null || !"http".equalsIgnoreCase(u.getScheme()) || !LOCAL_HOST.equals(u.getHost())
+        || u.getPort() != LOCAL_PORT) return null;
+    String path = u.getPath();
+    if (path == null || path.isEmpty()) path = "/";
+    if (path.endsWith("/")) path += "index.html";
+    Map<String, String> headers = new HashMap<>();
+    headers.put("Cache-Control", "no-cache");
+    if (path.contains("..") || path.contains("//")) {
+      return new WebResourceResponse("text/plain", "utf-8", 404, "Not Found", headers, null);
+    }
+    try {
+      InputStream in = getAssets().open(LOCAL_ASSETS + path);
+      return new WebResourceResponse(mimeFor(path), "utf-8", 200, "OK", headers, in);
+    } catch (IOException e) {
+      Log.w(TAG, "No bundled file for " + path);
+      return new WebResourceResponse("text/plain", "utf-8", 404, "Not Found", headers, null);
+    }
+  }
+
+  static String mimeFor(String path) {
+    String p = path.toLowerCase(Locale.ROOT);
+    if (p.endsWith(".html") || p.endsWith(".htm")) return "text/html";
+    if (p.endsWith(".js") || p.endsWith(".mjs")) return "text/javascript";
+    if (p.endsWith(".css")) return "text/css";
+    if (p.endsWith(".json")) return "application/json";
+    if (p.endsWith(".svg")) return "image/svg+xml";
+    if (p.endsWith(".png")) return "image/png";
+    if (p.endsWith(".jpg") || p.endsWith(".jpeg")) return "image/jpeg";
+    if (p.endsWith(".webp")) return "image/webp";
+    if (p.endsWith(".gif")) return "image/gif";
+    if (p.endsWith(".woff2")) return "font/woff2";
+    if (p.endsWith(".txt")) return "text/plain";
+    return "application/octet-stream";
   }
 
   private int dp(float v) {
@@ -412,10 +532,16 @@ public class MainActivity extends Activity {
     Log.i(TAG, "Home alias " + (home ? "on" : "off"));
   }
 
-  /** Watches for the two-finger exit hold; all touches still go to the page. */
+  /** Watches for the two-finger exit hold; all touches still go to the page (after a stale-touch reset). */
   @Override
   public boolean dispatchTouchEvent(MotionEvent e) {
     switch (e.getActionMasked()) {
+      case MotionEvent.ACTION_DOWN:
+        // Android sends DOWN only when every earlier finger has lifted. If the page still holds a
+        // touch from before (see cancelPageTouches), clear it first so this tap is not read as a
+        // second finger. With no stale touch the cancel is a no-op.
+        cancelPageTouches();
+        break;
       case MotionEvent.ACTION_POINTER_DOWN:
         if (e.getPointerCount() == 2) {
           for (int i = 0; i < 2; i++) {
@@ -458,10 +584,37 @@ public class MainActivity extends Activity {
     handler.removeCallbacks(showControls);
   }
 
+  /**
+   * Ends any touch the page thinks is still down. On a PF1007L (2026-10-16) the WebView sometimes
+   * kept one touch "down" for good after the two-finger controls opened (not every time), while
+   * Android reported no touch at all. Every later tap then arrived as a second finger and the page
+   * ignored it (no pointerdown). A cancel resets the page's touch state; with no touch active it
+   * does nothing.
+   */
+  private void cancelPageTouches() {
+    if (web == null) return;
+    // The stuck touch was pointer id 1 (the second finger of the hold), so a single-pointer cancel
+    // (id 0) left it in place. Name every id the panel can use; the page ignores ids it isn't holding.
+    MotionEvent.PointerProperties[] props = new MotionEvent.PointerProperties[CANCEL_POINTER_IDS];
+    MotionEvent.PointerCoords[] coords = new MotionEvent.PointerCoords[CANCEL_POINTER_IDS];
+    for (int i = 0; i < CANCEL_POINTER_IDS; i++) {
+      props[i] = new MotionEvent.PointerProperties();
+      props[i].id = i;
+      props[i].toolType = MotionEvent.TOOL_TYPE_FINGER;
+      coords[i] = new MotionEvent.PointerCoords();
+    }
+    long now = SystemClock.uptimeMillis();
+    MotionEvent cancel = MotionEvent.obtain(now, now, MotionEvent.ACTION_CANCEL, CANCEL_POINTER_IDS,
+        props, coords, 0, 0, 1f, 1f, 0, 0, InputDevice.SOURCE_TOUCHSCREEN, 0);
+    web.dispatchTouchEvent(cancel);
+    cancel.recycle();
+  }
+
   @Override
   public void onWindowFocusChanged(boolean hasFocus) {
     super.onWindowFocusChanged(hasFocus);
     if (hasFocus) hideSystemUi();
+    else cancelPageTouches(); // a dialog or another app took over mid-touch
   }
 
   private void hideSystemUi() {
